@@ -1,9 +1,12 @@
 /*	ruby mysql module
  *	$Id: mysql.c 244 2009-02-01 08:43:39Z tommy $
  */
-#define ulong unsigned long
+#ifndef ulong
+typedef unsigned long int ulong;
+#endif
 
 #include <ruby.h>
+#include <ruby/encoding.h>
 #ifndef RSTRING_PTR
 #define RSTRING_PTR(str) RSTRING(str)->ptr
 #endif
@@ -37,6 +40,10 @@ void rb_thread_stop_timer(void);
 #include <mysql/mysqld_error.h>
 #endif
 
+#if defined(HAVE_RUBY_ENCODING_H) && HAVE_RUBY_ENCODING_H
+# define M17N_SUPPORTED
+#endif
+
 #define MYSQL_RUBY_VERSION 20801
 
 #define GC_STORE_RESULT_LIMIT 20
@@ -62,6 +69,126 @@ VALUE cMysqlTime;
 VALUE eMysql;
 
 static int store_result_count = 0;
+
+#ifdef M17N_SUPPORTED
+/**
+ * The mapping from canonical encoding names in Mysql to ones in Ruby.
+ */
+static const char * const (enc_mysql2ruby_mapping[][2]) = {
+	    {"big5",          "Big5"         },
+	    /*{"dec8",          ""       },*/
+	    {"cp850",         "CP850"        },
+	    /*{"hp8",           ""       },*/
+	    {"koi8r",         "KOI8-R"       },
+	    {"latin1",        "Windows-1252" },
+	    {"latin2",        "ISO-8859-2"   },
+	    /*{"swe7",          ""       },*/
+	    {"ascii",         "US-ASCII"     },
+	    {"ujis",          "EUC-JP"       },
+	    {"sjis",          "Shift_JIS"    },
+	    {"hebrew",        "ISO-8859-8"   },
+	    /*{"tis620",        ""           },*/
+	    {"euckr",         "EUC-KR"       },
+	    {"koi8u",         "KOI8-U"       },
+	    {"gb2312",        "GB2312"       },
+	    {"greek",         "ISO-8859-7"   },
+	    {"cp1250",        "Windows-1250" },
+	    {"gbk",           "GBK"          },
+	    {"latin5",        "ISO-8859-9"   },
+	    /*{"armscii8",      ""           },*/
+	    {"utf8",          "UTF-8"        },
+	    /*{"ucs2",          "" },*/
+	    {"cp866",         "IBM866"       },
+	    /*{"keybcs2",       ""           },*/
+	    /*{"macce",         ""           },*/
+	    {"macroman",      "macRoman"     },
+	    {"cp852",         "CP852"        },
+	    {"latin7",        "ISO-8859-13"  },
+	    {"cp1251",        "Windows-1251" },
+	    {"cp1256",        "Windows-1256" },
+	    {"cp1257",        "Windows-1257" },
+	    /*{"binary",        "" },*/
+	    /*{"geostd8",       "" },*/
+	    {"cp932",         "Windows-31J"  }/*,
+	    {"eucjpms",       ""}*/
+};
+
+/*
+ * A cache of mapping from Mysql's encoding names to Ruby's rb_encoding*s.
+ */
+static struct st_table *enc_mysql2ruby;
+static ID s_id_index;
+
+static int enc_get_index(VALUE val)
+{
+       int i = ENCODING_GET_INLINED(val);
+       if (i == ENCODING_INLINE_MAX) {
+               VALUE iv = rb_ivar_get(val, s_id_index);
+               i = NUM2INT(iv);
+       }
+       return i;
+}
+extern int rb_enc_alias(const char *alias, const char *orig); /* declaration missing in Ruby 1.9.1 */
+
+static rb_encoding *
+find_or_create_johab(void)
+{
+	static const char * const aliases[] = { "JOHAB", "Windows-1361", "CP1361" };
+	int enc_index;
+	int i;
+	for (i = 0; i < sizeof(aliases)/sizeof(aliases[0]); ++i) {
+		enc_index = rb_enc_find_index(aliases[i]);
+		if (enc_index > 0) return rb_enc_from_index(enc_index);
+	}
+
+	enc_index = rb_define_dummy_encoding(aliases[0]);
+	for (i = 1; i < sizeof(aliases)/sizeof(aliases[0]); ++i) {
+		rb_enc_alias(aliases[i], aliases[0]);
+	}
+	return rb_enc_from_index(enc_index);
+}
+
+/*
+ * Returns the client_encoding of the given connection as a rb_encoding*
+ *
+ * * returns NULL if the client encoding is 'SQL_ASCII'.
+ * * returns ASCII-8BIT if the client encoding is unknown.
+ */
+static rb_encoding *
+get_client_encoding_as_rb_encoding(MYSQL * m)
+{
+	rb_encoding *enc;
+	const char* name = mysql_character_set_name(m);
+	if (st_lookup(enc_mysql2ruby, (st_data_t)name, (st_data_t*)&enc)) {
+		return enc;
+	}
+	else {
+		int i;
+		if (strcmp("SQL_ASCII", name) == 0) {
+			enc = NULL;
+			goto cache;
+		}
+		for (i = 0; i < sizeof(enc_mysql2ruby_mapping)/sizeof(enc_mysql2ruby_mapping[0]); ++i) {
+			if (strcmp(name, enc_mysql2ruby_mapping[i][0]) == 0) {
+				enc = rb_enc_find(enc_mysql2ruby_mapping[i][1]);
+				goto cache;
+			}
+		}
+
+		/* Ruby 1.9.1 does not supoort JOHAB */
+		if (strcmp(name, "JOHAB") == 0) {
+			enc = find_or_create_johab();
+			goto cache;
+		}
+
+		enc = rb_ascii8bit_encoding();
+	}
+cache:
+	st_insert(enc_mysql2ruby, (st_data_t)name, (st_data_t)enc);
+	return enc;
+}
+
+#endif
 
 struct mysql {
     MYSQL handler;
@@ -92,6 +219,14 @@ struct mysql_stmt {
     } result;
     MYSQL_RES *res;
 };
+#endif
+
+#ifdef M17N_SUPPORTED
+# define ASSOCIATE_INDEX(obj, index_holder) rb_enc_associate_index((obj), enc_get_index((index_holder)))
+static rb_encoding * get_client_encoding_as_rb_encoding(MYSQL* m);
+static int enc_get_index(VALUE val);
+#else
+# define ASSOCIATE_INDEX(obj, index_holder) /* nothing */
 #endif
 
 /*	free Mysql class object		*/
@@ -179,18 +314,30 @@ static void free_mysqlstmt(struct mysql_stmt* s)
 static void mysql_raise(MYSQL* m)
 {
     VALUE e = rb_exc_new2(eMysql, mysql_error(m));
+#if MYSQL_VERSION_ID >= 40101
+    VALUE msg;
+#endif
     rb_iv_set(e, "errno", INT2FIX(mysql_errno(m)));
 #if MYSQL_VERSION_ID >= 40101
-    rb_iv_set(e, "sqlstate", rb_tainted_str_new2(mysql_sqlstate(m)));
+    msg = rb_tainted_str_new2(mysql_sqlstate(m));
+    rb_iv_set(e, "sqlstate", msg);
 #endif
     rb_exc_raise(e);
 }
 
-static VALUE mysqlres2obj(MYSQL_RES* res)
+static VALUE mysqlres2obj(MYSQL_RES* res, VALUE conn)
 {
     VALUE obj;
     struct mysql_res* resp;
+#ifdef M17N_SUPPORTED
+    rb_encoding *enc;
     obj = Data_Make_Struct(cMysqlRes, struct mysql_res, 0, free_mysqlres, resp);
+    MYSQL* m = GetHandler(conn);
+    enc = get_client_encoding_as_rb_encoding(m);
+    rb_enc_set_index(obj, rb_enc_to_index(enc));
+#else
+    obj = Data_Make_Struct(cMysqlRes, struct mysql_res, 0, free_mysqlres, resp);
+#endif
     rb_iv_set(obj, "colname", Qnil);
     rb_iv_set(obj, "tblcolname", Qnil);
     resp->res = res;
@@ -208,6 +355,7 @@ static VALUE make_field_obj(MYSQL_FIELD* f)
     if (f == NULL)
 	return Qnil;
     obj = rb_obj_alloc(cMysqlField);
+    /*rb_tainted*/
     rb_iv_set(obj, "name", f->name? rb_str_freeze(rb_tainted_str_new2(f->name)): Qnil);
     rb_iv_set(obj, "table", f->table? rb_str_freeze(rb_tainted_str_new2(f->table)): Qnil);
     rb_iv_set(obj, "def", f->def? rb_str_freeze(rb_tainted_str_new2(f->def)): Qnil);
@@ -533,7 +681,9 @@ static VALUE field_count(VALUE obj)
 /*	host_info()	*/
 static VALUE host_info(VALUE obj)
 {
-    return rb_tainted_str_new2(mysql_get_host_info(GetHandler(obj)));
+    VALUE ret = rb_tainted_str_new2(mysql_get_host_info(GetHandler(obj)));
+    ASSOCIATE_INDEX(ret, obj);
+    return ret;
 }
 
 /*	proto_info()	*/
@@ -545,14 +695,23 @@ static VALUE proto_info(VALUE obj)
 /*	server_info()	*/
 static VALUE server_info(VALUE obj)
 {
-    return rb_tainted_str_new2(mysql_get_server_info(GetHandler(obj)));
+    VALUE ret = rb_tainted_str_new2(mysql_get_server_info(GetHandler(obj)));
+    ASSOCIATE_INDEX(ret, obj);
+    return ret;
 }
 
 /*	info()		*/
 static VALUE info(VALUE obj)
 {
     const char* p = mysql_info(GetHandler(obj));
-    return p? rb_tainted_str_new2(p): Qnil;
+    VALUE ret;
+    if(p){
+        ret = rb_tainted_str_new2(p);
+        ASSOCIATE_INDEX(ret, obj);
+    } else {
+        ret = Qnil;
+    }
+    return ret;
 }
 
 /*	insert_id()	*/
@@ -586,8 +745,11 @@ static VALUE list_dbs(int argc, VALUE* argv, VALUE obj)
 
     n = mysql_num_rows(res);
     ret = rb_ary_new2(n);
-    for (i=0; i<n; i++)
-	rb_ary_store(ret, i, rb_tainted_str_new2(mysql_fetch_row(res)[0]));
+    for (i=0; i<n; i++){
+        VALUE row_str = rb_tainted_str_new2(mysql_fetch_row(res)[0]);
+        ASSOCIATE_INDEX(ret, obj);
+	rb_ary_store(ret, i, row_str);
+    }
     mysql_free_result(res);
     return ret;
 }
@@ -602,7 +764,7 @@ static VALUE list_fields(int argc, VALUE* argv, VALUE obj)
     res = mysql_list_fields(m, StringValuePtr(table), NILorSTRING(field));
     if (res == NULL)
 	mysql_raise(m);
-    return mysqlres2obj(res);
+    return mysqlres2obj(res,obj);
 }
 
 /*	list_processes()	*/
@@ -612,7 +774,7 @@ static VALUE list_processes(VALUE obj)
     MYSQL_RES* res = mysql_list_processes(m);
     if (res == NULL)
 	mysql_raise(m);
-    return mysqlres2obj(res);
+    return mysqlres2obj(res,obj);
 }
 
 /*	list_tables(table=nil)	*/
@@ -631,8 +793,11 @@ static VALUE list_tables(int argc, VALUE* argv, VALUE obj)
 
     n = mysql_num_rows(res);
     ret = rb_ary_new2(n);
-    for (i=0; i<n; i++)
-	rb_ary_store(ret, i, rb_tainted_str_new2(mysql_fetch_row(res)[0]));
+    for (i=0; i<n; i++){
+        VALUE row = rb_tainted_str_new2(mysql_fetch_row(res)[0]);
+        ASSOCIATE_INDEX(ret, obj);
+	rb_ary_store(ret, i, row);
+    }
     mysql_free_result(res);
     return ret;
 }
@@ -694,9 +859,12 @@ static VALUE my_stat(VALUE obj)
 {
     MYSQL* m = GetHandler(obj);
     const char* s = mysql_stat(m);
+    VALUE ret;
     if (s == NULL)
 	mysql_raise(m);
-    return rb_tainted_str_new2(s);
+    ret = rb_tainted_str_new2(s);
+    ASSOCIATE_INDEX(ret, obj);
+    return ret;
 }
 
 /*	store_result()	*/
@@ -706,7 +874,7 @@ static VALUE store_result(VALUE obj)
     MYSQL_RES* res = mysql_store_result(m);
     if (res == NULL)
 	mysql_raise(m);
-    return mysqlres2obj(res);
+    return mysqlres2obj(res,obj);
 }
 
 /*	thread_id()	*/
@@ -722,7 +890,7 @@ static VALUE use_result(VALUE obj)
     MYSQL_RES* res = mysql_use_result(m);
     if (res == NULL)
 	mysql_raise(m);
-    return mysqlres2obj(res);
+    return mysqlres2obj(res,obj);
 }
 
 static VALUE res_free(VALUE);
@@ -744,7 +912,7 @@ static VALUE query(VALUE obj, VALUE sql)
 		if (mysql_field_count(m) != 0)
 		    mysql_raise(m);
 	    } else {
-		VALUE robj = mysqlres2obj(res);
+		VALUE robj = mysqlres2obj(res,obj);
 		rb_ensure(rb_yield, robj, res_free, robj);
 	    }
 #if MYSQL_VERSION_ID >= 40101
@@ -863,7 +1031,9 @@ static VALUE set_server_option(VALUE obj, VALUE option)
 static VALUE sqlstate(VALUE obj)
 {
     MYSQL *m = GetHandler(obj);
-    return rb_tainted_str_new2(mysql_sqlstate(m));
+    VALUE ret = rb_tainted_str_new2(mysql_sqlstate(m));
+    ASSOCIATE_INDEX(ret, obj);
+    return ret;
 }
 #endif
 
@@ -1027,8 +1197,16 @@ static VALUE fetch_row(VALUE obj)
     if (row == NULL)
 	return Qnil;
     ary = rb_ary_new2(n);
-    for (i=0; i<n; i++)
-	rb_ary_store(ary, i, row[i]? rb_tainted_str_new(row[i], lengths[i]): Qnil);
+    for (i=0; i<n; i++){
+        VALUE row_str; 
+        if(row[i]){
+	    row_str = rb_tainted_str_new(row[i], lengths[i]);
+            ASSOCIATE_INDEX(row_str, obj);
+	}else{
+	    row_str = Qnil;
+	}
+	rb_ary_store(ary, i, row_str);
+    }
     return ary;
 }
 
@@ -1053,6 +1231,7 @@ static VALUE fetch_hash2(VALUE obj, VALUE with_table)
             colname = rb_ary_new2(n);
             for (i=0; i<n; i++) {
                 VALUE s = rb_tainted_str_new2(fields[i].name);
+                ASSOCIATE_INDEX(s, obj);
                 rb_obj_freeze(s);
                 rb_ary_store(colname, i, s);
             }
@@ -1067,6 +1246,7 @@ static VALUE fetch_hash2(VALUE obj, VALUE with_table)
                 int len = strlen(fields[i].table)+strlen(fields[i].name)+1;
                 VALUE s = rb_tainted_str_new(NULL, len);
                 snprintf(RSTRING_PTR(s), len+1, "%s.%s", fields[i].table, fields[i].name);
+                ASSOCIATE_INDEX(s, obj);
                 rb_obj_freeze(s);
                 rb_ary_store(colname, i, s);
             }
@@ -1075,7 +1255,14 @@ static VALUE fetch_hash2(VALUE obj, VALUE with_table)
         }
     }
     for (i=0; i<n; i++) {
-        rb_hash_aset(hash, rb_ary_entry(colname, i), row[i]? rb_tainted_str_new(row[i], lengths[i]): Qnil);
+        VALUE row_str;
+        if(row[i]){
+	    row_str = rb_tainted_str_new(row[i], lengths[i]);
+            ASSOCIATE_INDEX(row_str, obj);
+	}else{
+	    row_str = Qnil;
+	}
+        rb_hash_aset(hash, rb_ary_entry(colname, i), row_str);
     }
     return hash;
 }
@@ -1252,11 +1439,13 @@ static void check_stmt_closed(VALUE obj)
 	rb_raise(eMysql, "Mysql::Stmt object is already closed");
 }
 
-static void mysql_stmt_raise(MYSQL_STMT* s)
+static void mysql_stmt_raise(VALUE obj, MYSQL_STMT* s)
 {
-    VALUE e = rb_exc_new2(eMysql, mysql_stmt_error(s));
+    VALUE m,e = rb_exc_new2(eMysql, mysql_stmt_error(s));
     rb_iv_set(e, "errno", INT2FIX(mysql_stmt_errno(s)));
-    rb_iv_set(e, "sqlstate", rb_tainted_str_new2(mysql_stmt_sqlstate(s)));
+    m = rb_tainted_str_new2(mysql_stmt_sqlstate(s));
+    ASSOCIATE_INDEX(m, obj);
+    rb_iv_set(e, "sqlstate", m);
     rb_exc_raise(e);
 }
 
@@ -1325,7 +1514,7 @@ static VALUE stmt_bind_result(int argc, VALUE *argv, VALUE obj)
 	else
 	    rb_raise(rb_eTypeError, "unrecognized class: %s", RSTRING_PTR(rb_inspect(argv[i])));
 	if (mysql_stmt_bind_result(s->stmt, s->result.bind))
-	    mysql_stmt_raise(s->stmt);
+	    mysql_stmt_raise(obj, s->stmt);
     }
     return obj;
 }
@@ -1430,15 +1619,15 @@ static VALUE stmt_execute(int argc, VALUE *argv, VALUE obj)
             }
         }
         if (mysql_stmt_bind_param(stmt, s->param.bind))
-            mysql_stmt_raise(stmt);
+            mysql_stmt_raise(obj, stmt);
     }
 
     if (mysql_stmt_execute(stmt))
-	mysql_stmt_raise(stmt);
+	mysql_stmt_raise(obj, stmt);
     if (s->res) {
 	MYSQL_FIELD *field;
 	if (mysql_stmt_store_result(stmt))
-	    mysql_stmt_raise(stmt);
+	    mysql_stmt_raise(obj, stmt);
 	field = mysql_fetch_fields(s->res);
 	for (i = 0; i < s->result.n; i++) {
             switch(s->result.bind[i].buffer_type) {
@@ -1484,7 +1673,7 @@ static VALUE stmt_execute(int argc, VALUE *argv, VALUE obj)
             }
 	}
 	if (mysql_stmt_bind_result(s->stmt, s->result.bind))
-	    mysql_stmt_raise(s->stmt);
+	    mysql_stmt_raise(obj, s->stmt);
     }
     return obj;
 }
@@ -1506,7 +1695,7 @@ static VALUE stmt_fetch(VALUE obj)
         rb_raise(rb_eRuntimeError, "unexpectedly data truncated");
 #endif
     if (r == 1)
-	mysql_stmt_raise(s->stmt);
+	mysql_stmt_raise(obj, s->stmt);
 
     ret = rb_ary_new2(s->result.n);
     for (i = 0; i < s->result.n; i++) {
@@ -1573,6 +1762,8 @@ static VALUE stmt_fetch(VALUE obj)
             case MYSQL_TYPE_BIT:
 #endif
                 v = rb_tainted_str_new(s->result.bind[i].buffer, s->result.length[i]);
+                ASSOCIATE_INDEX(v, obj);
+
                 break;
             default:
                 rb_raise(rb_eTypeError, "unknown buffer_type: %d", s->result.bind[i].buffer_type);
@@ -1609,7 +1800,7 @@ static VALUE stmt_free_result(VALUE obj)
     struct mysql_stmt* s = DATA_PTR(obj);
     check_stmt_closed(obj);
     if (mysql_stmt_free_result(s->stmt))
-	mysql_stmt_raise(s->stmt);
+	mysql_stmt_raise(obj, s->stmt);
     return obj;
 }
 
@@ -1655,7 +1846,7 @@ static VALUE stmt_prepare(VALUE obj, VALUE query)
     check_stmt_closed(obj);
     Check_Type(query, T_STRING);
     if (mysql_stmt_prepare(s->stmt, RSTRING_PTR(query), RSTRING_LEN(query)))
-	mysql_stmt_raise(s->stmt);
+	mysql_stmt_raise(obj, s->stmt);
 
     n = mysql_stmt_param_count(s->stmt);
     s->param.n = n;
@@ -1683,7 +1874,7 @@ static VALUE stmt_prepare(VALUE obj, VALUE query)
 	}
     } else {
 	if (mysql_stmt_errno(s->stmt))
-	    mysql_stmt_raise(s->stmt);
+	    mysql_stmt_raise(obj, s->stmt);
     }
 
     return obj;
@@ -1696,7 +1887,7 @@ static VALUE stmt_reset(VALUE obj)
     struct mysql_stmt* s = DATA_PTR(obj);
     check_stmt_closed(obj);
     if (mysql_stmt_reset(s->stmt))
-	mysql_stmt_raise(s->stmt);
+	mysql_stmt_raise(obj, s->stmt);
     return obj;
 }
 #endif
@@ -1710,10 +1901,10 @@ static VALUE stmt_result_metadata(VALUE obj)
     res = mysql_stmt_result_metadata(s->stmt);
     if (res == NULL) {
       if (mysql_stmt_errno(s->stmt) != 0)
-	mysql_stmt_raise(s->stmt);
+	mysql_stmt_raise(obj, s->stmt);
       return Qnil;
     }
-    return mysqlres2obj(res);
+    return mysqlres2obj(res,obj);
 }
 
 /*	row_seek(offset)	*/
@@ -1749,10 +1940,10 @@ static VALUE stmt_send_long_data(VALUE obj, VALUE col, VALUE data)
     if (0 <= c && c < s->param.n) {
 	s->param.bind[c].buffer_type = MYSQL_TYPE_STRING;
 	if (mysql_stmt_bind_param(s->stmt, s->param.bind))
-	    mysql_stmt_raise(s->stmt);
+	    mysql_stmt_raise(obj, s->stmt);
     }
     if (mysql_stmt_send_long_data(s->stmt, c, RSTRING_PTR(data), RSTRING_LEN(data)))
-	mysql_stmt_raise(s->stmt);
+	mysql_stmt_raise(obj, s->stmt);
     return obj;
 }
 #endif
@@ -1761,7 +1952,9 @@ static VALUE stmt_send_long_data(VALUE obj, VALUE col, VALUE data)
 static VALUE stmt_sqlstate(VALUE obj)
 {
     struct mysql_stmt* s = DATA_PTR(obj);
-    return rb_tainted_str_new2(mysql_stmt_sqlstate(s->stmt));
+    VALUE ret = rb_tainted_str_new2(mysql_stmt_sqlstate(s->stmt));
+    ASSOCIATE_INDEX(ret, obj);
+    return ret;
 }
 
 /*-------------------------------
@@ -2102,6 +2295,10 @@ void Init_mysql(void)
 #if MYSQL_VERSION_ID >= 40101
     rb_define_const(cMysql, "OPTION_MULTI_STATEMENTS_ON", INT2NUM(MYSQL_OPTION_MULTI_STATEMENTS_ON));
     rb_define_const(cMysql, "OPTION_MULTI_STATEMENTS_OFF", INT2NUM(MYSQL_OPTION_MULTI_STATEMENTS_OFF));
+#endif
+#ifdef M17N_SUPPORTED
+    enc_mysql2ruby = st_init_strtable();
+    s_id_index = rb_intern("@encoding");
 #endif
 
     /* Mysql::Result object method */
