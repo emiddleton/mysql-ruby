@@ -1,7 +1,7 @@
 require 'rubygems' unless defined?(Gem)
 
 spec = Gem::Specification.new do |s|
-  s.name     = "mysql-ruby"
+  s.name     = "emiddleton-mysql-ruby"
   s.author   = "Masahiro TOMITA"
   s.email    = "tommy.(at).tmtm.org"
   s.version  = "2.8.1"
